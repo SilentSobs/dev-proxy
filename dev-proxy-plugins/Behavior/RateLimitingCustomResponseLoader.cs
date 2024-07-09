@@ -9,10 +9,10 @@ namespace Microsoft.DevProxy.Plugins.Behavior;
 
 internal class RateLimitingCustomResponseLoader : IDisposable
 {
-    private readonly IProxyLogger _logger;
+    private readonly ILogger _logger;
     private readonly RateLimitConfiguration _configuration;
 
-    public RateLimitingCustomResponseLoader(IProxyLogger logger, RateLimitConfiguration configuration)
+    public RateLimitingCustomResponseLoader(ILogger logger, RateLimitConfiguration configuration)
     {
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _configuration = configuration ?? throw new ArgumentNullException(nameof(configuration));
@@ -31,17 +31,13 @@ internal class RateLimitingCustomResponseLoader : IDisposable
 
         try
         {
-            using (FileStream stream = new FileStream(_customResponseFilePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            using var stream = new FileStream(_customResponseFilePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            using var reader = new StreamReader(stream);
+            var responseString = reader.ReadToEnd();
+            var response = JsonSerializer.Deserialize<MockResponseResponse>(responseString, ProxyUtils.JsonSerializerOptions);
+            if (response is not null)
             {
-                using (StreamReader reader = new StreamReader(stream))
-                {
-                    var responseString = reader.ReadToEnd();
-                    var response = JsonSerializer.Deserialize<MockResponseResponse>(responseString, ProxyUtils.JsonSerializerOptions);
-                    if (response is not null)
-                    {
-                        _configuration.CustomResponse = response;
-                    }
-                }
+                _configuration.CustomResponse = response;
             }
         }
         catch (Exception ex)

@@ -9,10 +9,10 @@ namespace Microsoft.DevProxy.Plugins.RandomErrors;
 
 internal class GenericErrorResponsesLoader : IDisposable
 {
-    private readonly IProxyLogger _logger;
+    private readonly ILogger _logger;
     private readonly GenericRandomErrorConfiguration _configuration;
 
-    public GenericErrorResponsesLoader(IProxyLogger logger, GenericRandomErrorConfiguration configuration)
+    public GenericErrorResponsesLoader(ILogger logger, GenericRandomErrorConfiguration configuration)
     {
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _configuration = configuration ?? throw new ArgumentNullException(nameof(configuration));
@@ -26,25 +26,21 @@ internal class GenericErrorResponsesLoader : IDisposable
         if (!File.Exists(_errorsFile))
         {
             _logger.LogWarning("File {configurationFile} not found in the current directory. No error responses will be loaded", _configuration.ErrorsFile);
-            _configuration.Responses = Array.Empty<GenericErrorResponse>();
+            _configuration.Errors = Array.Empty<GenericErrorResponse>();
             return;
         }
 
         try
         {
-            using (FileStream stream = new FileStream(_errorsFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            using var stream = new FileStream(_errorsFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            using var reader = new StreamReader(stream);
+            var responsesString = reader.ReadToEnd();
+            var responsesConfig = JsonSerializer.Deserialize<GenericRandomErrorConfiguration>(responsesString, ProxyUtils.JsonSerializerOptions);
+            IEnumerable<GenericErrorResponse>? configResponses = responsesConfig?.Errors;
+            if (configResponses is not null)
             {
-                using (StreamReader reader = new StreamReader(stream))
-                {
-                    var responsesString = reader.ReadToEnd();
-                    var responsesConfig = JsonSerializer.Deserialize<GenericRandomErrorConfiguration>(responsesString, ProxyUtils.JsonSerializerOptions);
-                    IEnumerable<GenericErrorResponse>? configResponses = responsesConfig?.Responses;
-                    if (configResponses is not null)
-                    {
-                        _configuration.Responses = configResponses;
-                        _logger.LogInformation("{configResponseCount} error responses loaded from {errorFile}", configResponses.Count(), _configuration.ErrorsFile);
-                    }
-                }
+                _configuration.Errors = configResponses;
+                _logger.LogInformation("{configResponseCount} error responses loaded from {errorFile}", configResponses.Count(), _configuration.ErrorsFile);
             }
         }
         catch (Exception ex)

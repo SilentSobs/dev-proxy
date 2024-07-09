@@ -24,7 +24,7 @@ enum ToggleSystemProxyAction
 public class ProxyEngine
 {
     private readonly PluginEvents _pluginEvents;
-    private readonly IProxyLogger _logger;
+    private readonly ILogger _logger;
     private readonly ProxyConfiguration _config;
     private static ProxyServer? _proxyServer;
     private ExplicitProxyEndPoint? _explicitEndPoint;
@@ -33,7 +33,10 @@ public class ProxyEngine
     // lists of hosts to watch extracted from urlsToWatch,
     // used for deciding which URLs to decrypt for further inspection
     private ISet<UrlToWatch> _hostsToWatch = new HashSet<UrlToWatch>();
-    private Dictionary<string, object> _globalData = new();
+    private Dictionary<string, object> _globalData = new() {
+        { ProxyUtils.ReportsKey, new Dictionary<string, object>() }
+    };
+    private static readonly object consoleLock = new object();
 
     private bool _isRecording = false;
     private List<RequestLog> _requestLogs = new List<RequestLog>();
@@ -42,6 +45,8 @@ public class ProxyEngine
     private Dictionary<int, Dictionary<string, object>> _pluginData = new();
 
     public static X509Certificate2? Certificate => _proxyServer?.CertificateManager.RootCertificate;
+
+    private ExceptionHandler _exceptionHandler => ex => _logger.LogError(ex, "An error occurred in a plugin");
 
     static ProxyEngine()
     {
@@ -54,7 +59,7 @@ public class ProxyEngine
         _proxyServer.CertificateManager.CreateRootCertificate();
     }
 
-    public ProxyEngine(ProxyConfiguration config, ISet<UrlToWatch> urlsToWatch, PluginEvents pluginEvents, IProxyLogger logger)
+    public ProxyEngine(ProxyConfiguration config, ISet<UrlToWatch> urlsToWatch, PluginEvents pluginEvents, ILogger logger)
     {
         _config = config ?? throw new ArgumentNullException(nameof(config));
         _urlsToWatch = urlsToWatch ?? throw new ArgumentNullException(nameof(urlsToWatch));
@@ -150,7 +155,15 @@ public class ProxyEngine
             _logger.LogInformation("Configure your application to use this proxy's port and address");
         }
 
-        PrintHotkeys();
+        var isInteractive = !Console.IsInputRedirected &&
+            Environment.GetEnvironmentVariable("CI") is null;
+
+        if (isInteractive)
+        {
+            // only print hotkeys when they can be used
+            PrintHotkeys();
+        }
+
         Console.CancelKeyPress += Console_CancelKeyPress;
 
         if (_config.Record)
@@ -161,7 +174,7 @@ public class ProxyEngine
 
         // we need this check or proxy will fail with an exception
         // when run for example in VSCode's integrated terminal
-        if (!Console.IsInputRedirected)
+        if (isInteractive)
         {
             ReadKeys();
         }
@@ -241,7 +254,7 @@ public class ProxyEngine
             }
             if (key == ConsoleKey.W)
             {
-                _pluginEvents.RaiseMockRequest(new EventArgs()).GetAwaiter().GetResult();
+                _pluginEvents.RaiseMockRequest(new EventArgs(), _exceptionHandler).GetAwaiter().GetResult();
             }
         } while (key != ConsoleKey.Escape);
     }
@@ -271,12 +284,17 @@ public class ProxyEngine
         // we let plugins handle previously recorded requests
         var clonedLogs = _requestLogs.ToArray();
         _requestLogs.Clear();
-        await _pluginEvents.RaiseRecordingStopped(new RecordingArgs(clonedLogs));
+        await _pluginEvents.RaiseRecordingStopped(new RecordingArgs(clonedLogs)
+        {
+            GlobalData = _globalData
+        }, _exceptionHandler);
+        
+        _logger.LogInformation("DONE");
     }
 
     private void PrintRecordingIndicator()
     {
-        lock (ConsoleLogger.ConsoleLock)
+        lock (consoleLock)
         {
             if (_isRecording)
             {
@@ -443,8 +461,7 @@ public class ProxyEngine
             return -1;
         }
 
-        var pid = -1;
-        if (int.TryParse(pidString, out pid))
+        if (int.TryParse(pidString, out var pid))
         {
             return pid;
         }
@@ -489,9 +506,21 @@ public class ProxyEngine
 
     async Task OnRequest(object sender, SessionEventArgs e)
     {
-        if (IsProxiedHost(e.HttpClient.Request.RequestUri.Host))
+        if (IsProxiedHost(e.HttpClient.Request.RequestUri.Host) &&
+            IsIncludedByHeaders(e.HttpClient.Request.Headers))
         {
-            _pluginData.Add(e.GetHashCode(), new Dictionary<string, object>());
+            _pluginData.Add(e.GetHashCode(), []);
+            var responseState = new ResponseState();
+            var proxyRequestArgs = new ProxyRequestArgs(e, responseState)
+            {
+                SessionData = _pluginData[e.GetHashCode()],
+                GlobalData = _globalData
+            };
+            if (!proxyRequestArgs.HasRequestUrlMatch(_urlsToWatch))
+            {
+                return;
+            }
+
 
             // we need to keep the request body for further processing
             // by plugins
@@ -501,35 +530,67 @@ public class ProxyEngine
                 await e.GetRequestBodyAsString();
             }
 
+            using var scope = _logger.BeginScope(e.HttpClient.Request.Method, e.HttpClient.Request.Url, e.GetHashCode());
+
             e.UserData = e.HttpClient.Request;
             _logger.LogRequest(new[] { $"{e.HttpClient.Request.Method} {e.HttpClient.Request.Url}" }, MessageType.InterceptedRequest, new LoggingContext(e));
-            await HandleRequest(e);
+            await HandleRequest(e, proxyRequestArgs);
         }
     }
 
-    private async Task HandleRequest(SessionEventArgs e)
+    private async Task HandleRequest(SessionEventArgs e, ProxyRequestArgs proxyRequestArgs)
     {
-        ResponseState responseState = new ResponseState();
-        var proxyRequestArgs = new ProxyRequestArgs(e, responseState)
-        {
-            SessionData = _pluginData[e.GetHashCode()],
-            GlobalData = _globalData
-        };
-
-        await _pluginEvents.RaiseProxyBeforeRequest(proxyRequestArgs);
+        await _pluginEvents.RaiseProxyBeforeRequest(proxyRequestArgs, _exceptionHandler);
 
         // We only need to set the proxy header if the proxy has not set a response and the request is going to be sent to the target.
-        if (!responseState.HasBeenSet)
+        if (!proxyRequestArgs.ResponseState.HasBeenSet)
         {
-            _logger?.LogRequest(new[] { "Passed through" }, MessageType.PassedThrough, new LoggingContext(e));
+            _logger?.LogRequest(["Passed through"], MessageType.PassedThrough, new LoggingContext(e));
             AddProxyHeader(e.HttpClient.Request);
         }
     }
 
-    private static void AddProxyHeader(Request r) => r.Headers?.AddHeader("Via", $"{r.HttpVersion} graph-proxy/{ProxyUtils.ProductVersion}");
+    private static void AddProxyHeader(Request r) => r.Headers?.AddHeader("Via", $"{r.HttpVersion} dev-proxy/{ProxyUtils.ProductVersion}");
 
     private bool IsProxiedHost(string hostName) => _hostsToWatch.Any(h => h.Url.IsMatch(hostName));
 
+    private bool IsIncludedByHeaders(HeaderCollection requestHeaders)
+    {
+        if (_config.FilterByHeaders is null)
+        {
+            return true;
+        }
+
+        foreach (var header in _config.FilterByHeaders)
+        {
+            _logger.LogDebug("Checking header {header} with value {value}...",
+                header.Name,
+                string.IsNullOrEmpty(header.Value) ? "(any)" : header.Value
+            );
+
+            if (requestHeaders.HeaderExists(header.Name))
+            {
+                if (string.IsNullOrEmpty(header.Value))
+                {
+                    _logger.LogDebug("Request has header {header}", header.Name);
+                    return true;
+                }
+
+                if (requestHeaders.GetHeaders(header.Name)!.Any(h => h.Value.Contains(header.Value)))
+                {
+                    _logger.LogDebug("Request header {header} contains value {value}", header.Name, header.Value);
+                    return true;
+                }
+            }
+            else
+            {
+                _logger.LogDebug("Request doesn't have header {header}", header.Name);
+            }
+        }
+
+        _logger.LogDebug("Request doesn't match any header filter. Ignoring");
+        return false;
+    }
 
     // Modify response
     async Task OnBeforeResponse(object sender, SessionEventArgs e)
@@ -542,6 +603,12 @@ public class ProxyEngine
                 SessionData = _pluginData[e.GetHashCode()],
                 GlobalData = _globalData
             };
+            if (!proxyResponseArgs.HasRequestUrlMatch(_urlsToWatch))
+            {
+                return;
+            }
+
+            using var scope = _logger.BeginScope(e.HttpClient.Request.Method, e.HttpClient.Request.Url, e.GetHashCode());
 
             // necessary to make the response body available to plugins
             e.HttpClient.Response.KeepBody = true;
@@ -550,7 +617,7 @@ public class ProxyEngine
                 await e.GetResponseBody();
             }
 
-            await _pluginEvents.RaiseProxyBeforeResponse(proxyResponseArgs);
+            await _pluginEvents.RaiseProxyBeforeResponse(proxyResponseArgs, _exceptionHandler);
         }
     }
     async Task OnAfterResponse(object sender, SessionEventArgs e)
@@ -563,9 +630,24 @@ public class ProxyEngine
                 SessionData = _pluginData[e.GetHashCode()],
                 GlobalData = _globalData
             };
+            if (!proxyResponseArgs.HasRequestUrlMatch(_urlsToWatch))
+            {
+                // clean up
+                _pluginData.Remove(e.GetHashCode());
+                return;
+            }
 
-            _logger.LogRequest(new[] { $"{e.HttpClient.Request.Method} {e.HttpClient.Request.Url}" }, MessageType.InterceptedResponse, new LoggingContext(e));
-            await _pluginEvents.RaiseProxyAfterResponse(proxyResponseArgs);
+            // necessary to repeat to make the response body
+            // of mocked requests available to plugins
+            e.HttpClient.Response.KeepBody = true;
+
+            using var scope = _logger.BeginScope(e.HttpClient.Request.Method, e.HttpClient.Request.Url, e.GetHashCode());
+
+            var message = $"{e.HttpClient.Request.Method} {e.HttpClient.Request.Url}";
+            _logger.LogRequest([message], MessageType.InterceptedResponse, new LoggingContext(e));
+            await _pluginEvents.RaiseProxyAfterResponse(proxyResponseArgs, _exceptionHandler);
+            _logger.LogRequest([message], MessageType.FinishedProcessingRequest, new LoggingContext(e));
+
             // clean up
             _pluginData.Remove(e.GetHashCode());
         }
@@ -589,9 +671,10 @@ public class ProxyEngine
         // set e.clientCertificate to override
         return Task.CompletedTask;
     }
-    
+
     private void PrintHotkeys()
     {
+        Console.WriteLine("");
         Console.WriteLine("Hotkeys: issue (w)eb request, (r)ecord, (s)top recording, (c)lear screen");
         Console.WriteLine("Press CTRL+C to stop Dev Proxy");
         Console.WriteLine("");

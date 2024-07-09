@@ -1,5 +1,5 @@
 {
-  "$schema": "https://raw.githubusercontent.com/microsoft/dev-proxy/main/schemas/v0.17.1/rc.schema.json",
+  "$schema": "https://raw.githubusercontent.com/microsoft/dev-proxy/main/schemas/v0.20.0/rc.schema.json",
   "plugins": [
     {
       "name": "RetryAfterPlugin",
@@ -20,7 +20,6 @@
     "errorsFile": "devproxy-errors.json"
   },
   "rate": 50,
-  "labelMode": "text",
   "logLevel": "information",
   "newVersionNotification": "stable"
 }

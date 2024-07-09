@@ -9,10 +9,10 @@ namespace Microsoft.DevProxy.Plugins.Mocks;
 
 internal class MockResponsesLoader : IDisposable
 {
-    private readonly IProxyLogger _logger;
+    private readonly ILogger _logger;
     private readonly MockResponseConfiguration _configuration;
 
-    public MockResponsesLoader(IProxyLogger logger, MockResponseConfiguration configuration)
+    public MockResponsesLoader(ILogger logger, MockResponseConfiguration configuration)
     {
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _configuration = configuration ?? throw new ArgumentNullException(nameof(configuration));
@@ -32,19 +32,15 @@ internal class MockResponsesLoader : IDisposable
 
         try
         {
-            using (FileStream stream = new FileStream(_responsesFilePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            using var stream = new FileStream(_responsesFilePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            using var reader = new StreamReader(stream);
+            var responsesString = reader.ReadToEnd();
+            var responsesConfig = JsonSerializer.Deserialize<MockResponseConfiguration>(responsesString, ProxyUtils.JsonSerializerOptions);
+            IEnumerable<MockResponse>? configResponses = responsesConfig?.Mocks;
+            if (configResponses is not null)
             {
-                using (StreamReader reader = new StreamReader(stream))
-                {
-                    var responsesString = reader.ReadToEnd();
-                    var responsesConfig = JsonSerializer.Deserialize<MockResponseConfiguration>(responsesString, ProxyUtils.JsonSerializerOptions);
-                    IEnumerable<MockResponse>? configResponses = responsesConfig?.Mocks;
-                    if (configResponses is not null)
-                    {
-                        _configuration.Mocks = configResponses;
-                        _logger.LogInformation("Mock responses for {configResponseCount} url patterns loaded from {mockFile}", configResponses.Count(), _configuration.MocksFile);
-                    }
-                }
+                _configuration.Mocks = configResponses;
+                _logger.LogInformation("Mock responses for {configResponseCount} url patterns loaded from {mockFile}", configResponses.Count(), _configuration.MocksFile);
             }
         }
         catch (Exception ex)

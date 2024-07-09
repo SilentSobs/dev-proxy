@@ -10,27 +10,28 @@ using Microsoft.Extensions.Logging;
 
 namespace Microsoft.DevProxy.Plugins.RequestLogs;
 
-public class MockGeneratorPlugin : BaseProxyPlugin
+public class MockGeneratorPlugin : BaseReportingPlugin
 {
+    public MockGeneratorPlugin(IPluginEvents pluginEvents, IProxyContext context, ILogger logger, ISet<UrlToWatch> urlsToWatch, IConfigurationSection? configSection = null) : base(pluginEvents, context, logger, urlsToWatch, configSection)
+    {
+    }
+
     public override string Name => nameof(MockGeneratorPlugin);
 
-    public override void Register(IPluginEvents pluginEvents,
-                            IProxyContext context,
-                            ISet<UrlToWatch> urlsToWatch,
-                            IConfigurationSection? configSection = null)
+    public override void Register()
     {
-        base.Register(pluginEvents, context, urlsToWatch, configSection);
+        base.Register();
 
-        pluginEvents.AfterRecordingStop += AfterRecordingStop;
+        PluginEvents.AfterRecordingStop += AfterRecordingStop;
     }
 
     private Task AfterRecordingStop(object? sender, RecordingArgs e)
     {
-        _logger?.LogInformation("Creating mocks from recorded requests...");
+        Logger.LogInformation("Creating mocks from recorded requests...");
 
         if (!e.RequestLogs.Any())
         {
-            _logger?.LogDebug("No requests to process");
+            Logger.LogDebug("No requests to process");
             return Task.CompletedTask;
         }
 
@@ -47,9 +48,9 @@ public class MockGeneratorPlugin : BaseProxyPlugin
             }
 
             var methodAndUrlString = request.MessageLines.First();
-            _logger?.LogDebug("Processing request {methodAndUrlString}...", methodAndUrlString);
+            Logger.LogDebug("Processing request {methodAndUrlString}...", methodAndUrlString);
 
-            var methodAndUrl = GetMethodAndUrl(methodAndUrlString);
+            var (method, url) = GetMethodAndUrl(methodAndUrlString);
             var response = request.Context.Session.HttpClient.Response;
 
             var newHeaders = new List<MockResponseHeader>();
@@ -58,8 +59,8 @@ public class MockGeneratorPlugin : BaseProxyPlugin
             {
                 Request = new()
                 {
-                    Method = methodAndUrl.Item1,
-                    Url = methodAndUrl.Item2,
+                    Method = method,
+                    Url = url,
                 },
                 Response = new()
                 {
@@ -71,28 +72,30 @@ public class MockGeneratorPlugin : BaseProxyPlugin
             // skip mock if it's 200 but has no body
             if (mock.Response.StatusCode == 200 && mock.Response.Body is null)
             {
-                _logger?.LogDebug("Skipping mock with 200 response code and no body");
+                Logger.LogDebug("Skipping mock with 200 response code and no body");
                 continue;
             }
 
             mocks.Add(mock);
-            _logger?.LogDebug("Added mock for {method} {url}", mock.Request.Method, mock.Request.Url);
+            Logger.LogDebug("Added mock for {method} {url}", mock.Request.Method, mock.Request.Url);
         }
 
-        _logger?.LogDebug("Sorting mocks...");
+        Logger.LogDebug("Sorting mocks...");
         // sort mocks descending by url length so that most specific mocks are first
         mocks.Sort((a, b) => b.Request!.Url.CompareTo(a.Request!.Url));
 
         var mocksFile = new MockResponseConfiguration { Mocks = mocks };
 
-        _logger?.LogDebug("Serializing mocks...");
+        Logger.LogDebug("Serializing mocks...");
         var mocksFileJson = JsonSerializer.Serialize(mocksFile, ProxyUtils.JsonSerializerOptions);
         var fileName = $"mocks-{DateTime.Now:yyyyMMddHHmmss}.json";
 
-        _logger?.LogDebug("Writing mocks to {fileName}...", fileName);
+        Logger.LogDebug("Writing mocks to {fileName}...", fileName);
         File.WriteAllText(fileName, mocksFileJson);
 
-        _logger?.LogInformation("Created mock file {fileName} with {mocksCount} mocks", fileName, mocks.Count);
+        Logger.LogInformation("Created mock file {fileName} with {mocksCount} mocks", fileName, mocks.Count);
+
+        StoreReport(fileName, e);
 
         return Task.CompletedTask;
     }
@@ -105,59 +108,59 @@ public class MockGeneratorPlugin : BaseProxyPlugin
     /// <returns>Response body or @filename for binary responses</returns>
     private async Task<dynamic?> GetResponseBody(SessionEventArgs session)
     {
-        _logger?.LogDebug("Getting response body...");
+        Logger.LogDebug("Getting response body...");
 
         var response = session.HttpClient.Response;
         if (response.ContentType is null || !response.HasBody)
         {
-            _logger?.LogDebug("Response has no content-type set or has no body. Skipping");
+            Logger.LogDebug("Response has no content-type set or has no body. Skipping");
             return null;
         }
 
         if (response.ContentType.Contains("application/json"))
         {
-            _logger?.LogDebug("Response is JSON");
+            Logger.LogDebug("Response is JSON");
 
             try
             {
-                _logger?.LogDebug("Reading response body as string...");
+                Logger.LogDebug("Reading response body as string...");
                 var body = response.IsBodyRead ? response.BodyString : await session.GetResponseBodyAsString();
-                _logger?.LogDebug("Body: {body}", body);
-                _logger?.LogDebug("Deserializing response body...");
+                Logger.LogDebug("Body: {body}", body);
+                Logger.LogDebug("Deserializing response body...");
                 return JsonSerializer.Deserialize<dynamic>(body, ProxyUtils.JsonSerializerOptions);
             }
             catch (Exception ex)
             {
-                _logger?.LogError(ex, "Error reading response body");
+                Logger.LogError(ex, "Error reading response body");
                 return null;
             }
         }
 
-        _logger?.LogDebug("Response is binary");
+        Logger.LogDebug("Response is binary");
         // assume body is binary
         try
         {
             var filename = $"response-{Guid.NewGuid()}.bin";
-            _logger?.LogDebug("Reading response body as bytes...");
+            Logger.LogDebug("Reading response body as bytes...");
             var body = await session.GetResponseBody();
-            _logger?.LogDebug("Writing response body to {filename}...", filename);
+            Logger.LogDebug("Writing response body to {filename}...", filename);
             File.WriteAllBytes(filename, body);
             return $"@{filename}";
         }
         catch (Exception ex)
         {
-            _logger?.LogError(ex, "Error reading response body");
+            Logger.LogError(ex, "Error reading response body");
             return null;
         }
     }
 
-    private Tuple<string, string> GetMethodAndUrl(string message)
+    private (string method, string url) GetMethodAndUrl(string message)
     {
         var info = message.Split(" ");
         if (info.Length > 2)
         {
             info = [info[0], string.Join(" ", info.Skip(1))];
         }
-        return new Tuple<string, string>(info[0], info[1]);
+        return (info[0], info[1]);
     }
 }

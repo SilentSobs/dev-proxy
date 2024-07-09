@@ -2,9 +2,9 @@
 // Licensed under the MIT License.
 
 using Microsoft.DevProxy.Abstractions;
-using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using System.CommandLine;
+using System.Diagnostics;
 using System.Net;
 
 namespace Microsoft.DevProxy;
@@ -127,7 +127,7 @@ internal class ProxyHost
                 };
                 _logLevelOption.AddValidator(input =>
                 {
-                    if (!Enum.TryParse<LogLevel>(input.Tokens.First().Value, true, out var logLevel))
+                    if (!Enum.TryParse<LogLevel>(input.Tokens.First().Value, true, out _))
                     {
                         input.ErrorMessage = $"{input.Tokens.First().Value} is not a valid log level. Allowed values are: {string.Join(", ", Enum.GetNames(typeof(LogLevel)))}";
                     }
@@ -201,7 +201,7 @@ internal class ProxyHost
         };
         _ipAddressOption.AddValidator(input =>
         {
-            if (!IPAddress.TryParse(input.Tokens.First().Value, out var ipAddress))
+            if (!IPAddress.TryParse(input.Tokens.First().Value, out _))
             {
                 input.ErrorMessage = $"{input.Tokens.First().Value} is not a valid IP address";
             }
@@ -226,10 +226,17 @@ internal class ProxyHost
         _rateOption.ArgumentHelpName = "failure rate";
         _rateOption.AddValidator((input) =>
         {
-            int? value = input.GetValueForOption(_rateOption);
-            if (value.HasValue && (value < 0 || value > 100))
+            try
             {
-                input.ErrorMessage = $"{value} is not a valid failure rate. Specify a number between 0 and 100";
+                int? value = input.GetValueForOption(_rateOption);
+                if (value.HasValue && (value < 0 || value > 100))
+                {
+                    input.ErrorMessage = $"{value} is not a valid failure rate. Specify a number between 0 and 100";
+                }
+            }
+            catch (InvalidOperationException ex)
+            {
+                input.ErrorMessage = ex.Message;
             }
         });
 
@@ -237,16 +244,34 @@ internal class ProxyHost
 
         _asSystemProxyOption = new Option<bool?>(AsSystemProxyOptionName, "Set Dev Proxy as the system proxy");
         _asSystemProxyOption.SetDefaultValue(true);
+        _asSystemProxyOption.AddValidator(input =>
+        {
+            try
+            {
+                _ = input.GetValueForOption(_asSystemProxyOption);
+            }
+            catch (InvalidOperationException ex)
+            {
+                input.ErrorMessage = ex.Message;
+            }
+        });
 
         _installCertOption = new Option<bool?>(InstallCertOptionName, "Install self-signed certificate");
         _installCertOption.SetDefaultValue(true);
-        _installCertOption.AddValidator((input) =>
+        _installCertOption.AddValidator(input =>
         {
-            var asSystemProxy = input.GetValueForOption(_asSystemProxyOption) ?? true;
-            var installCert = input.GetValueForOption(_installCertOption) ?? true;
-            if (asSystemProxy && !installCert)
+            try
             {
-                input.ErrorMessage = $"Requires option '--{_asSystemProxyOption.Name}' to be 'false'";
+                var asSystemProxy = input.GetValueForOption(_asSystemProxyOption) ?? true;
+                var installCert = input.GetValueForOption(_installCertOption) ?? true;
+                if (asSystemProxy && !installCert)
+                {
+                    input.ErrorMessage = $"Requires option '--{_asSystemProxyOption.Name}' to be 'false'";
+                }
+            }
+            catch (InvalidOperationException ex)
+            {
+                input.ErrorMessage = ex.Message;
             }
         });
 
@@ -261,7 +286,7 @@ internal class ProxyHost
         ProxyCommandHandler.Configuration.ConfigFile = ConfigFile;
     }
 
-    public RootCommand GetRootCommand(IProxyLogger logger)
+    public RootCommand GetRootCommand(ILogger logger)
     {
         var command = new RootCommand {
             _portOption,
@@ -301,6 +326,17 @@ internal class ProxyHost
 
         command.Add(presetCommand);
 
+        var configCommand = new Command("config", "Open devproxyrc.json");
+        configCommand.SetHandler(() =>
+        {
+            var cfgPsi = new ProcessStartInfo(ConfigFile)
+            {
+                UseShellExecute = true
+            };
+            Process.Start(cfgPsi);
+        });
+        command.Add(configCommand);
+
         var outdatedCommand = new Command("outdated", "Check for new version");
         var outdatedShortOption = new Option<bool>("--short", "Return version only");
         outdatedCommand.AddOption(outdatedShortOption);
@@ -311,7 +347,7 @@ internal class ProxyHost
         return command;
     }
 
-    public ProxyCommandHandler GetCommandHandler(PluginEvents pluginEvents, Option[] optionsFromPlugins, ISet<UrlToWatch> urlsToWatch, IProxyLogger logger) => new ProxyCommandHandler(
+    public ProxyCommandHandler GetCommandHandler(PluginEvents pluginEvents, Option[] optionsFromPlugins, ISet<UrlToWatch> urlsToWatch, ILogger logger) => new ProxyCommandHandler(
         pluginEvents,
         new Option[] {
             _portOption,

@@ -2,37 +2,31 @@
 // Licensed under the MIT License.
 
 using System.Diagnostics;
-using System.Diagnostics.Tracing;
-using System.Text.Json;
-using Azure.Core;
-using Azure.Core.Diagnostics;
-using Azure.Identity;
+using System.Text.Json.Serialization;
 using Microsoft.DevProxy.Abstractions;
-using Microsoft.DevProxy.Plugins;
 using Microsoft.DevProxy.Plugins.RequestLogs.ApiCenter;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 
-internal class ApiInformation
+namespace Microsoft.DevProxy.Plugins.RequestLogs;
+
+public enum ApiCenterProductionVersionPluginReportItemStatus
 {
-    public ApiInformationVersion[] Versions { get; set; } = [];
-    // deployment.properties.server.runtimeUri[]
-    public string[] Urls { get; set; } = [];
+    NotRegistered,
+    NonProduction,
+    Production
 }
 
-internal class ApiInformationVersion
+public class ApiCenterProductionVersionPluginReportItem
 {
-    public ApiInformationVersionInformation Version { get; set; } = new();
-    public ApiLifecycleStage? LifecycleStage { get; set; }
+    public required string Method { get; init; }
+    public required string Url { get; init; }
+    [JsonConverter(typeof(JsonStringEnumConverter))]
+    public required ApiCenterProductionVersionPluginReportItemStatus Status { get; init; }
+    public string? Recommendation { get; init; }
 }
 
-internal class ApiInformationVersionInformation
-{
-    // properties.title
-    public string Name { get; set; } = "";
-    // name
-    public string Id { get; set; } = "";
-}
+public class ApiCenterProductionVersionPluginReport : List<ApiCenterProductionVersionPluginReportItem>;
 
 internal class ApiCenterProductionVersionPluginConfiguration
 {
@@ -40,100 +34,58 @@ internal class ApiCenterProductionVersionPluginConfiguration
     public string ResourceGroupName { get; set; } = "";
     public string ServiceName { get; set; } = "";
     public string WorkspaceName { get; set; } = "default";
-    public bool ExcludeDevCredentials { get; set; } = false;
-    public bool ExcludeProdCredentials { get; set; } = true;
 }
 
-public class ApiCenterProductionVersionPlugin : BaseProxyPlugin
+public class ApiCenterProductionVersionPlugin : BaseReportingPlugin
 {
     private ApiCenterProductionVersionPluginConfiguration _configuration = new();
-    private readonly string[] _scopes = ["https://management.azure.com/.default"];
-    private TokenCredential _credential = new DefaultAzureCredential();
-    private HttpClient? _httpClient;
-    private JsonSerializerOptions _jsonSerializerOptions = new JsonSerializerOptions
+    private ApiCenterClient? _apiCenterClient;
+    private Api[]? _apis;
+
+    public ApiCenterProductionVersionPlugin(IPluginEvents pluginEvents, IProxyContext context, ILogger logger, ISet<UrlToWatch> urlsToWatch, IConfigurationSection? configSection = null) : base(pluginEvents, context, logger, urlsToWatch, configSection)
     {
-        PropertyNameCaseInsensitive = true,
-        PropertyNamingPolicy = JsonNamingPolicy.CamelCase
-    };
+    }
 
     public override string Name => nameof(ApiCenterProductionVersionPlugin);
 
-    public override void Register(IPluginEvents pluginEvents,
-                            IProxyContext context,
-                            ISet<UrlToWatch> urlsToWatch,
-                            IConfigurationSection? configSection = null)
+    public override void Register()
     {
-        base.Register(pluginEvents, context, urlsToWatch, configSection);
+        base.Register();
 
-        configSection?.Bind(_configuration);
+        ConfigSection?.Bind(_configuration);
 
-        if (string.IsNullOrEmpty(_configuration.SubscriptionId))
-        {
-            _logger?.LogError("Specify SubscriptionId in the ApiCenterProductionVersionPlugin configuration. The ApiCenterProductionVersionPlugin will not be used.");
-            return;
-        }
-        if (string.IsNullOrEmpty(_configuration.ResourceGroupName))
-        {
-            _logger?.LogError("Specify ResourceGroupName in the ApiCenterProductionVersionPlugin configuration. The ApiCenterProductionVersionPlugin will not be used.");
-            return;
-        }
-        if (string.IsNullOrEmpty(_configuration.ServiceName))
-        {
-            _logger?.LogError("Specify ServiceName in the ApiCenterProductionVersionPlugin configuration. The ApiCenterProductionVersionPlugin will not be used.");
-            return;
-        }
-        if (_configuration.ExcludeDevCredentials && _configuration.ExcludeProdCredentials)
-        {
-            _logger?.LogError("Both ExcludeDevCredentials and ExcludeProdCredentials are set to true. You need to use at least one set of credentials The {plugin} will not be used.", Name);
-            return;
-        }
-
-        var credentials = new List<TokenCredential>();
-        if (!_configuration.ExcludeDevCredentials)
-        {
-            credentials.AddRange([
-                new SharedTokenCacheCredential(),
-                new VisualStudioCredential(),
-                new VisualStudioCodeCredential(),
-                new AzureCliCredential(),
-                new AzurePowerShellCredential(),
-                new AzureDeveloperCliCredential(),
-            ]);
-        }
-        if (!_configuration.ExcludeProdCredentials)
-        {
-            credentials.AddRange([
-                new EnvironmentCredential(),
-                new WorkloadIdentityCredential(),
-                new ManagedIdentityCredential()
-            ]);
-        }
-        _credential = new ChainedTokenCredential(credentials.ToArray());
-
-        if (_logger?.LogLevel == LogLevel.Debug)
-        {
-            var consoleListener = AzureEventSourceListener.CreateConsoleLogger(EventLevel.Verbose);
-        }
-
-        _logger?.LogDebug("[{now}] Plugin {plugin} checking Azure auth...", DateTime.Now, Name);
         try
         {
-            _ = _credential.GetTokenAsync(new TokenRequestContext(_scopes), CancellationToken.None).Result;
+            _apiCenterClient = new(
+                new()
+                {
+                    SubscriptionId = _configuration.SubscriptionId,
+                    ResourceGroupName = _configuration.ResourceGroupName,
+                    ServiceName = _configuration.ServiceName,
+                    WorkspaceName = _configuration.WorkspaceName
+                },
+                Logger
+            );
         }
-        catch (AuthenticationFailedException ex)
+        catch (Exception ex)
         {
-            _logger?.LogError(ex, "Failed to authenticate with Azure. The {plugin} will not be used.", Name);
+            Logger.LogError(ex, "Failed to create API Center client. The {plugin} will not be used.", Name);
             return;
         }
-        _logger?.LogDebug("[{now}] Plugin {plugin} auth confirmed...", DateTime.Now, Name);
 
-        var authenticationHandler = new AuthenticationDelegatingHandler(_credential, _scopes)
+        Logger.LogInformation("Plugin {plugin} connecting to Azure...", Name);
+        try
         {
-            InnerHandler = new HttpClientHandler()
-        };
-        _httpClient = new HttpClient(authenticationHandler);
+            _ = _apiCenterClient.GetAccessToken(CancellationToken.None).Result;
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Failed to authenticate with Azure. The {plugin} will not be used.", Name);
+            return;
+        }
+        Logger.LogDebug("Plugin {plugin} auth confirmed...", Name);
 
-        pluginEvents.AfterRecordingStop += AfterRecordingStop;
+        PluginEvents.AfterRecordingStop += AfterRecordingStop;
     }
 
     private async Task AfterRecordingStop(object sender, RecordingArgs e)
@@ -145,175 +97,146 @@ public class ApiCenterProductionVersionPlugin : BaseProxyPlugin
             );
         if (!interceptedRequests.Any())
         {
-            _logger?.LogDebug("No requests to process");
+            Logger.LogDebug("No requests to process");
             return;
         }
 
-        _logger?.LogInformation("Checking if recorded API requests use production APIs as defined in API Center...");
+        Logger.LogInformation("Checking if recorded API requests use production APIs as defined in API Center...");
 
-        Debug.Assert(_httpClient is not null);
+        Debug.Assert(_apiCenterClient is not null);
 
-        var apis = await LoadApisFromApiCenter();
-        if (apis == null || !apis.Value.Any())
+        if (_apis is null)
         {
-            _logger?.LogInformation("No APIs found in API Center");
+            _apis = await _apiCenterClient.GetApis();
+        }
+
+        if (_apis == null || !_apis.Any())
+        {
+            Logger.LogInformation("No APIs found in API Center");
             return;
         }
 
-        var apisInformation = new List<ApiInformation>();
-        foreach (var api in apis.Value)
+        foreach (var api in _apis)
         {
-            var apiVersions = await LoadApiVersions(api);
-            if (apiVersions == null || !apiVersions.Value.Any())
+            Debug.Assert(api.Id is not null);
+
+            await api.LoadVersions(_apiCenterClient);
+            if (api.Versions?.Any() != true)
             {
-                _logger?.LogInformation("No versions found for {api}", api.Properties?.Title);
+                Logger.LogInformation("No versions found for {api}", api.Properties?.Title);
                 continue;
             }
 
-            var apiInformationVersion = apiVersions.Value.Select(v => new ApiInformationVersion
+            foreach (var versionFromApiCenter in api.Versions)
             {
-                Version = new ApiInformationVersionInformation
+                Debug.Assert(versionFromApiCenter.Id is not null);
+
+                await versionFromApiCenter.LoadDefinitions(_apiCenterClient);
+                if (versionFromApiCenter.Definitions?.Any() != true)
                 {
-                    Name = v.Properties?.Title ?? "",
-                    Id = v.Id ?? ""
-                },
-                LifecycleStage = v.Properties?.LifecycleStage
-            }).ToArray();
+                    Logger.LogDebug("No definitions found for version {versionId}", versionFromApiCenter.Id);
+                    continue;
+                }
 
-            var apiDeployments = await LoadApiDeployments(api);
-            if (apiDeployments == null || !apiDeployments.Value.Any())
-            {
-                _logger?.LogInformation("No deployments found for {api}", api.Properties?.Title);
-                continue;
+                var definitions = new List<ApiDefinition>();
+                foreach (var definitionFromApiCenter in versionFromApiCenter.Definitions)
+                {
+                    Debug.Assert(definitionFromApiCenter.Id is not null);
+
+                    await definitionFromApiCenter.LoadOpenApiDefinition(_apiCenterClient, Logger);
+
+                    if (definitionFromApiCenter.Definition is null)
+                    {
+                        Logger.LogDebug("API definition not found for {definitionId}", definitionFromApiCenter.Id);
+                        continue;
+                    }
+
+                    if (!definitionFromApiCenter.Definition.Servers.Any())
+                    {
+                        Logger.LogDebug("No servers found for API definition {definitionId}", definitionFromApiCenter.Id);
+                        continue;
+                    }
+
+                    definitions.Add(definitionFromApiCenter);
+                }
+
+                versionFromApiCenter.Definitions = definitions.ToArray();
             }
-
-            apisInformation.Add(new ApiInformation
-            {
-                Versions = apiInformationVersion,
-                Urls = apiDeployments.Value.SelectMany(d => d.Properties?.Server?.RuntimeUri ?? Array.Empty<string>()).ToArray()
-            });
         }
 
-        _logger?.LogInformation("Analyzing recorded requests...");
+        Logger.LogInformation("Analyzing recorded requests...");
+
+        var report = new ApiCenterProductionVersionPluginReport();
 
         foreach (var request in interceptedRequests)
         {
-            var urlAndMethodString = request.MessageLines.First();
-            var urlAndMethod = urlAndMethodString.Split(' ');
-
-            var apiInformation = FindMatchingApiInformation(urlAndMethod[1], apisInformation);
-            if (apiInformation == null)
+            var methodAndUrlString = request.MessageLines.First();
+            var methodAndUrl = methodAndUrlString.Split(' ');
+            var (method, url) = (methodAndUrl[0], methodAndUrl[1]);
+            if (method == "OPTIONS")
             {
                 continue;
             }
 
-            var lifecycleStage = FindMatchingApiLifecycleStage(request, urlAndMethod[1], apiInformation);
-            if (lifecycleStage == null)
+            var api = _apis.FindApiByUrl(url, Logger);
+            if (api == null)
             {
+                report.Add(new()
+                {
+                    Method = method,
+                    Url = url,
+                    Status = ApiCenterProductionVersionPluginReportItemStatus.NotRegistered
+                });
                 continue;
             }
+
+            var version = api.GetVersion(request, url, Logger);
+            if (version is null)
+            {
+                report.Add(new()
+                {
+                    Method = method,
+                    Url = url,
+                    Status = ApiCenterProductionVersionPluginReportItemStatus.NotRegistered
+                });
+                continue;
+            }
+
+            Debug.Assert(version.Properties is not null);
+            var lifecycleStage = version.Properties.LifecycleStage;
 
             if (lifecycleStage != ApiLifecycleStage.Production)
             {
-                var productionVersions = apiInformation.Versions
-                    .Where(v => v.LifecycleStage == ApiLifecycleStage.Production)
-                    .Select(v => v.Version.Name);
+                Debug.Assert(api.Versions is not null);
 
-                if (productionVersions.Any())
+                var productionVersions = api.Versions
+                    .Where(v => v.Properties?.LifecycleStage == ApiLifecycleStage.Production)
+                    .Select(v => v.Properties?.Title);
+
+                var recommendation = productionVersions.Any() ?
+                    string.Format("Request {0} uses API version {1} which is defined as {2}. Upgrade to a production version of the API. Recommended versions: {3}", methodAndUrlString, api.Versions.First(v => v.Properties?.LifecycleStage == lifecycleStage).Properties?.Title, lifecycleStage, string.Join(", ", productionVersions)) :
+                    string.Format("Request {0} uses API version {1} which is defined as {2}.", methodAndUrlString, api.Versions.First(v => v.Properties?.LifecycleStage == lifecycleStage).Properties?.Title, lifecycleStage);
+
+                Logger.LogWarning(recommendation);
+                report.Add(new()
                 {
-                    _logger?.LogWarning("Request {request} uses API version {version} which is defined as {lifecycleStage}. Upgrade to a production version of the API. Recommended versions: {versions}", urlAndMethodString, apiInformation.Versions.First(v => v.LifecycleStage == lifecycleStage).Version.Name, lifecycleStage, string.Join(", ", productionVersions));
-                }
-                else
+                    Method = method,
+                    Url = url,
+                    Status = ApiCenterProductionVersionPluginReportItemStatus.NonProduction,
+                    Recommendation = recommendation
+                });
+            }
+            else
+            {
+                report.Add(new()
                 {
-                    _logger?.LogWarning("Request {request} uses API version {version} which is defined as {lifecycleStage}.", urlAndMethodString, apiInformation.Versions.First(v => v.LifecycleStage == lifecycleStage).Version.Name, lifecycleStage);                    
-                }
+                    Method = method,
+                    Url = url,
+                    Status = ApiCenterProductionVersionPluginReportItemStatus.Production
+                });
             }
         }
 
-        _logger?.LogInformation("DONE");
-    }
-
-    private ApiInformation? FindMatchingApiInformation(string requestUrl, List<ApiInformation>? apisInformation)
-    {
-        var apiInformation = apisInformation?.FirstOrDefault(a => a.Urls.Any(u => requestUrl.StartsWith(u)));
-        if (apiInformation is null)
-        {
-            _logger?.LogDebug("No matching API found for {request}", requestUrl);
-        }
-        else
-        {
-            _logger?.LogDebug("Found matching API information for {request}", requestUrl);
-        }
-
-        return apiInformation;
-    }
-
-    private ApiLifecycleStage? FindMatchingApiLifecycleStage(RequestLog request, string requestUrl, ApiInformation apiInformation)
-    {
-        // determine version based on:
-        // - URL path and query parameters
-        // - headers
-        ApiInformationVersion? version = null;
-        foreach (var apiVersion in apiInformation.Versions)
-        {
-            // check URL
-            if (requestUrl.Contains(apiVersion.Version.Id) || requestUrl.Contains(apiVersion.Version.Name))
-            {
-                _logger?.LogDebug("Version {version} found in URL {url}", $"{apiVersion.Version.Id}/{apiVersion.Version.Name}", requestUrl);
-                version = apiVersion;
-                break;
-            }
-
-            // check headers
-            Debug.Assert(request.Context is not null);
-            var header = request.Context.Session.HttpClient.Request.Headers.FirstOrDefault(
-                h => h.Value.Contains(apiVersion.Version.Id) ||
-                h.Value.Contains(apiVersion.Version.Name)
-            );
-            if (header is not null)
-            {
-                _logger?.LogDebug("Version {version} found in header {header}", $"{apiVersion.Version.Id}/{apiVersion.Version.Name}", header.Name);
-                version = apiVersion;
-                break;
-            }
-        }
-
-        if (version is null)
-        {
-            _logger?.LogDebug("No matching version found for {request}", requestUrl);
-            return null;
-        }
-
-        return version.LifecycleStage;
-    }
-
-    private async Task<Collection<ApiVersion>?> LoadApiVersions(Api api)
-    {
-        Debug.Assert(_httpClient is not null);
-
-        _logger?.LogDebug("Loading versions for {api}...", api.Properties?.Title);
-
-        var res = await _httpClient.GetStringAsync($"https://management.azure.com{api.Id}/versions?api-version=2024-03-01");
-        return JsonSerializer.Deserialize<Collection<ApiVersion>>(res, _jsonSerializerOptions);
-    }
-
-    async Task<Collection<Api>?> LoadApisFromApiCenter()
-    {
-        Debug.Assert(_httpClient is not null);
-
-        _logger?.LogInformation("Loading APIs from API Center...");
-
-        var res = await _httpClient.GetStringAsync($"https://management.azure.com/subscriptions/{_configuration.SubscriptionId}/resourceGroups/{_configuration.ResourceGroupName}/providers/Microsoft.ApiCenter/services/{_configuration.ServiceName}/workspaces/{_configuration.WorkspaceName}/apis?api-version=2024-03-01");
-        return JsonSerializer.Deserialize<Collection<Api>>(res, _jsonSerializerOptions);
-    }
-
-    async Task<Collection<ApiDeployment>?> LoadApiDeployments(Api api)
-    {
-        Debug.Assert(_httpClient is not null);
-
-        _logger?.LogDebug("Loading API deployments for {api}...", api.Properties?.Title);
-
-        var res = await _httpClient.GetStringAsync($"https://management.azure.com{api.Id}/deployments?api-version=2024-03-01");
-        return JsonSerializer.Deserialize<Collection<ApiDeployment>>(res, _jsonSerializerOptions);
+        StoreReport(report, e);
     }
 }
